@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/grafana/grafana-plugin-sdk-go/build"
@@ -13,6 +14,8 @@ import (
 type apiProvider interface {
 	// Fetch is general purpose api
 	Fetch(path string, out interface{}) error
+	// FetchPaginated will read all pages
+	FetchPaginated(path string, out []interface{}) error
 
 	// GetOrganizations list the organizations
 	// https://docs.sentry.io/api/organizations/list-your-organizations/
@@ -55,6 +58,65 @@ func NewSentryClient(baseURL string, orgSlug string, authToken string, doerClien
 
 type SentryErrorResponse struct {
 	Detail string `json:"detail"`
+}
+
+func FindNextLink(res *http.Response, previous string) string {
+	links := res.Header.Get("Link")
+	if links != "" {
+		cutLinks := strings.Split(links, ",")
+		for _, link := range cutLinks {
+			if strings.Contains(link, "next") {
+				re := regexp.MustCompile("<(https?://.*)>")
+				match := re.FindStringSubmatch(link)
+				if len(match) >= 2 && match[1] != previous {
+					return match[1]
+				}
+			}
+		}
+	}
+	return ""
+}
+func ParseBody(res *http.Response, out interface{}) error {
+	defer res.Body.Close()
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (sc *SentryClient) FetchPaginated(path string, out []AnyType) error {
+	emptyOut := out
+	url := sc.BaseURL + path
+	for url != "" {
+		lastOut := emptyOut
+
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		res, err := sc.sentryHttpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		if res.StatusCode == http.StatusOK {
+			if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+				return err
+			}
+			if res.StatusCode == http.StatusOK {
+				if err := ParseBody(res, &lastOut); err != nil {
+					return err
+				}
+				url = FindNextLink(res, url)
+				out = append(out, lastOut...)
+			} else {
+				var errResponse SentryErrorResponse
+				if err := json.NewDecoder(res.Body).Decode(&errResponse); err != nil {
+					errorMesage := strings.TrimSpace(fmt.Sprintf("%s %s", res.Status, err.Error()))
+					return errors.New(errorMesage)
+				}
+				errorMesage := strings.TrimSpace(fmt.Sprintf("%s %s", res.Status, errResponse.Detail))
+				return errors.New(errorMesage)
+			}
+		}
+	}
+	return nil
 }
 
 func (sc *SentryClient) Fetch(path string, out interface{}) error {
